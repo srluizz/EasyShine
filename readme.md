@@ -17,7 +17,7 @@
 ## 🆗 Visualização
 
 <p align="center">
-  <img src="assets/Preview.png" alt="Visualização do programa" width="180"/>
+  <img src="assets/Preview.png" alt="Visualização do programa" width="696x500"/>
 </p>
 
 Visualização do aplicativo em funcionamento.
