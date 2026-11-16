@@ -28,10 +28,7 @@ user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
 
-GWL_EXSTYLE = -20
-
 WS_POPUP = 0x80000000
-WS_VISIBLE = 0x10000000
 
 WS_EX_LAYERED = 0x00080000
 WS_EX_TRANSPARENT = 0x00000020
@@ -40,23 +37,35 @@ WS_EX_NOACTIVATE = 0x08000000
 
 LWA_ALPHA = 0x00000002
 
-HWND_TOPMOST = ctypes.c_void_p(-1)
+HWND_TOPMOST = wintypes.HWND(-1)
 
 SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
 SWP_NOACTIVATE = 0x0010
-SWP_FRAMECHANGED = 0x0020
+SWP_SHOWWINDOW = 0x0040
+SWP_NOZORDER = 0x0004
+
+SW_SHOWNA = 8
 
 SM_XVIRTUALSCREEN = 76
 SM_YVIRTUALSCREEN = 77
 SM_CXVIRTUALSCREEN = 78
 SM_CYVIRTUALSCREEN = 79
 
+WM_DESTROY = 0x0002
 WM_QUIT = 0x0012
+WM_DISPLAYCHANGE = 0x007E
+WM_TIMER = 0x0113
 WM_USER = 0x0400
 WM_UPDATE_BRIGHTNESS = WM_USER + 1
+WM_SHUTDOWN_OVERLAY = WM_USER + 2
 
+PM_NOREMOVE = 0x0000
+ERROR_CLASS_ALREADY_EXISTS = 1410
 BLACK_BRUSH = 4
+TIMER_TOPMOST = 1
+TOPMOST_INTERVAL_MS = 2000
+DEFAULT_BRIGHTNESS = 80
 
 
 # =========================================================
@@ -65,19 +74,6 @@ BLACK_BRUSH = 4
 
 user32.GetSystemMetrics.argtypes = [ctypes.c_int]
 user32.GetSystemMetrics.restype = ctypes.c_int
-
-user32.SetWindowLongPtrW.argtypes = [
-    wintypes.HWND,
-    ctypes.c_int,
-    ctypes.c_ssize_t
-]
-user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
-
-user32.GetWindowLongPtrW.argtypes = [
-    wintypes.HWND,
-    ctypes.c_int
-]
-user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
 
 user32.SetLayeredWindowAttributes.argtypes = [
     wintypes.HWND,
@@ -98,11 +94,17 @@ user32.SetWindowPos.argtypes = [
 ]
 user32.SetWindowPos.restype = wintypes.BOOL
 
+user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.ShowWindow.restype = wintypes.BOOL
+
 user32.DestroyWindow.argtypes = [wintypes.HWND]
 user32.DestroyWindow.restype = wintypes.BOOL
 
-user32.RegisterClassW.argtypes = [ctypes.c_void_p]
+user32.RegisterClassW.argtypes = [ctypes.POINTER(ctypes.c_byte)]
 user32.RegisterClassW.restype = wintypes.WORD
+
+user32.UnregisterClassW.argtypes = [wintypes.LPCWSTR, wintypes.HINSTANCE]
+user32.UnregisterClassW.restype = wintypes.BOOL
 
 user32.CreateWindowExW.argtypes = [
     wintypes.DWORD,
@@ -136,8 +138,20 @@ user32.GetMessageW.argtypes = [
 ]
 user32.GetMessageW.restype = ctypes.c_int
 
+user32.PeekMessageW.argtypes = [
+    ctypes.POINTER(wintypes.MSG),
+    wintypes.HWND,
+    wintypes.UINT,
+    wintypes.UINT,
+    wintypes.UINT
+]
+user32.PeekMessageW.restype = wintypes.BOOL
+
 user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+user32.TranslateMessage.restype = wintypes.BOOL
+
 user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+user32.DispatchMessageW.restype = ctypes.c_ssize_t
 
 user32.PostThreadMessageW.argtypes = [
     wintypes.DWORD,
@@ -154,6 +168,20 @@ user32.PostMessageW.argtypes = [
     wintypes.LPARAM
 ]
 user32.PostMessageW.restype = wintypes.BOOL
+
+user32.PostQuitMessage.argtypes = [ctypes.c_int]
+user32.PostQuitMessage.restype = None
+
+user32.SetTimer.argtypes = [
+    wintypes.HWND,
+    ctypes.c_size_t,
+    wintypes.UINT,
+    ctypes.c_void_p
+]
+user32.SetTimer.restype = ctypes.c_size_t
+
+user32.KillTimer.argtypes = [wintypes.HWND, ctypes.c_size_t]
+user32.KillTimer.restype = wintypes.BOOL
 
 kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
 kernel32.GetModuleHandleW.restype = wintypes.HMODULE
@@ -192,6 +220,10 @@ class WNDCLASSW(ctypes.Structure):
     ]
 
 
+# RegisterClassW espera POINTER(WNDCLASSW); ajusta após a struct existir.
+user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+
+
 # =========================================================
 # APLICAÇÃO
 # =========================================================
@@ -200,14 +232,18 @@ class EasyShineApp:
 
     def __init__(self):
         self.running = True
-        self.current_brightness = 80
+        self.current_brightness = DEFAULT_BRIGHTNESS
         self.overlay_thread_id = None
+        self.class_registered = False
+        self.hinstance = None
+        self.class_name = "EasyShineOverlayWindow"
 
         self.icon = None
         self.hwnd = None
 
         self.commands = queue.Queue()
         self.shutdown_lock = threading.Lock()
+        self.state_lock = threading.Lock()
 
         self.overlay_ready = threading.Event()
         self.overlay_error = None
@@ -217,18 +253,49 @@ class EasyShineApp:
             daemon=True
         )
 
-        self.overlay_thread.start()
+        try:
+            self.overlay_thread.start()
 
-        if not self.overlay_ready.wait(timeout=10):
-            raise RuntimeError("Tempo esgotado ao iniciar o overlay.")
+            if not self.overlay_ready.wait(timeout=10):
+                raise RuntimeError("Tempo esgotado ao iniciar o overlay.")
 
-        if self.overlay_error:
-            raise self.overlay_error
+            if self.overlay_error:
+                raise self.overlay_error
 
-        self.setup_tray_icon()
-        self.icon.run_detached()
+            self.setup_tray_icon()
+            self.icon.run_detached()
+        except Exception:
+            self.quit_app()
+            if self.overlay_thread.is_alive():
+                self.overlay_thread.join(timeout=3)
+            raise
 
         print("EasyShine iniciado com sucesso.")
+
+    # =====================================================
+    # ESTADO THREAD-SAFE
+    # =====================================================
+
+    def get_hwnd(self):
+        with self.state_lock:
+            return self.hwnd
+
+    def set_hwnd(self, hwnd):
+        with self.state_lock:
+            self.hwnd = hwnd
+
+    def get_brightness(self):
+        with self.state_lock:
+            return self.current_brightness
+
+    def set_brightness(self, brightness):
+        with self.state_lock:
+            self.current_brightness = brightness
+
+    @staticmethod
+    def brightness_to_opacity(brightness):
+        brightness = max(0, min(100, int(brightness)))
+        return round((100 - brightness) * 255 / 100)
 
     # =====================================================
     # MONITORES
@@ -241,14 +308,66 @@ class EasyShineApp:
         height = user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
         return x, y, width, height
 
+    def refresh_overlay_bounds(self):
+        hwnd = self.get_hwnd()
+        if not hwnd:
+            return False
+
+        x, y, width, height = self.get_virtual_screen()
+        if width <= 0 or height <= 0:
+            return False
+
+        ok = user32.SetWindowPos(
+            hwnd,
+            None,
+            x,
+            y,
+            width,
+            height,
+            SWP_NOZORDER | SWP_NOACTIVATE
+        )
+        return bool(ok)
+
+    def ensure_topmost(self):
+        hwnd = self.get_hwnd()
+        if not hwnd:
+            return False
+
+        ok = user32.SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+        )
+        return bool(ok)
+
     # =====================================================
     # PROCEDIMENTO DA JANELA (WINDOW PROC)
     # =====================================================
 
     def window_proc(self, hwnd, msg, wparam, lparam):
         if msg == WM_UPDATE_BRIGHTNESS:
-            opacity = wparam
-            self.apply_opacity_native(opacity)
+            self.apply_opacity_native(hwnd, wparam)
+            return 0
+
+        if msg == WM_SHUTDOWN_OVERLAY:
+            user32.DestroyWindow(hwnd)
+            return 0
+
+        if msg == WM_DESTROY:
+            user32.KillTimer(hwnd, TIMER_TOPMOST)
+            self.set_hwnd(None)
+            user32.PostQuitMessage(0)
+            return 0
+
+        if msg == WM_DISPLAYCHANGE:
+            self.refresh_overlay_bounds()
+            self.ensure_topmost()
+            return 0
+
+        if msg == WM_TIMER and wparam == TIMER_TOPMOST:
+            self.refresh_overlay_bounds()
+            self.ensure_topmost()
             return 0
 
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -261,18 +380,28 @@ class EasyShineApp:
         try:
             self.overlay_thread_id = kernel32.GetCurrentThreadId()
 
+            # PeekMessage cria a fila de mensagens da thread antes do ready,
+            # evitando falha de PostThreadMessage no shutdown precoce.
+            bootstrap_msg = wintypes.MSG()
+            user32.PeekMessageW(
+                ctypes.byref(bootstrap_msg),
+                None,
+                0,
+                0,
+                PM_NOREMOVE
+            )
+
             # Guardar a referência do callback para evitar garbage collection
             self.window_proc_callback = WNDPROC(self.window_proc)
 
-            self.class_name = "EasyShineOverlayWindow"
-            instance = kernel32.GetModuleHandleW(None)
+            self.hinstance = kernel32.GetModuleHandleW(None)
 
             wc = WNDCLASSW()
             wc.style = 0
             wc.lpfnWndProc = self.window_proc_callback
             wc.cbClsExtra = 0
             wc.cbWndExtra = 0
-            wc.hInstance = instance
+            wc.hInstance = self.hinstance
             wc.hIcon = None
             wc.hCursor = None
             wc.hbrBackground = gdi32.GetStockObject(BLACK_BRUSH)
@@ -281,9 +410,15 @@ class EasyShineApp:
 
             atom = user32.RegisterClassW(ctypes.byref(wc))
             if not atom:
-                raise ctypes.WinError(ctypes.get_last_error())
+                error_code = ctypes.get_last_error()
+                if error_code != ERROR_CLASS_ALREADY_EXISTS:
+                    raise ctypes.WinError(error_code)
+            else:
+                self.class_registered = True
 
             x, y, width, height = self.get_virtual_screen()
+            if width <= 0 or height <= 0:
+                raise RuntimeError("Não foi possível obter o tamanho da tela virtual.")
 
             ex_style = (
                 WS_EX_LAYERED
@@ -292,9 +427,10 @@ class EasyShineApp:
                 | WS_EX_NOACTIVATE
             )
 
-            style = WS_POPUP | WS_VISIBLE
+            # Sem WS_VISIBLE: define alpha antes de exibir para evitar flash preto.
+            style = WS_POPUP
 
-            self.hwnd = user32.CreateWindowExW(
+            hwnd = user32.CreateWindowExW(
                 ex_style,
                 self.class_name,
                 "EasyShine",
@@ -305,27 +441,40 @@ class EasyShineApp:
                 height,
                 None,
                 None,
-                instance,
+                self.hinstance,
                 None
             )
 
-            if not self.hwnd:
+            if not hwnd:
                 raise ctypes.WinError(ctypes.get_last_error())
 
-            # Define opacidade inicial (80% brilho = ~51 de opacidade preta)
-            self.apply_opacity_native(51)
+            self.set_hwnd(hwnd)
 
-            user32.SetWindowPos(
-                self.hwnd,
+            initial_opacity = self.brightness_to_opacity(self.get_brightness())
+            if not self.apply_opacity_native(hwnd, initial_opacity):
+                raise ctypes.WinError(ctypes.get_last_error())
+
+            if not user32.SetWindowPos(
+                hwnd,
                 HWND_TOPMOST,
-                0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
-            )
+                x,
+                y,
+                width,
+                height,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW
+            ):
+                # Fallback: pelo menos tenta exibir a janela
+                user32.ShowWindow(hwnd, SW_SHOWNA)
+                if not self.ensure_topmost():
+                    raise ctypes.WinError(ctypes.get_last_error())
+
+            if not user32.SetTimer(hwnd, TIMER_TOPMOST, TOPMOST_INTERVAL_MS, None):
+                raise ctypes.WinError(ctypes.get_last_error())
 
             self.overlay_ready.set()
 
             msg = wintypes.MSG()
-            while self.running:
+            while True:
                 result = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
                 if result <= 0:
                     break
@@ -338,25 +487,32 @@ class EasyShineApp:
             traceback.print_exc()
 
         finally:
-            if self.hwnd:
-                user32.DestroyWindow(self.hwnd)
-                self.hwnd = None
+            hwnd = self.get_hwnd()
+            if hwnd:
+                user32.KillTimer(hwnd, TIMER_TOPMOST)
+                user32.DestroyWindow(hwnd)
+                self.set_hwnd(None)
+
+            if self.class_registered and self.hinstance:
+                user32.UnregisterClassW(self.class_name, self.hinstance)
+                self.class_registered = False
 
     # =====================================================
     # OPACIDADE NATIVA (EXECUTADA NA THREAD DA JANELA)
     # =====================================================
 
-    def apply_opacity_native(self, opacity):
-        if not self.hwnd:
-            return
+    def apply_opacity_native(self, hwnd, opacity):
+        if not hwnd:
+            return False
 
         opacity = max(0, min(255, int(opacity)))
-        user32.SetLayeredWindowAttributes(
-            self.hwnd,
+        ok = user32.SetLayeredWindowAttributes(
+            hwnd,
             0,
             opacity,
             LWA_ALPHA
         )
+        return bool(ok)
 
     # =====================================================
     # BRILHO
@@ -367,19 +523,18 @@ class EasyShineApp:
             return
 
         brightness = max(0, min(100, int(brightness)))
-        self.current_brightness = brightness
+        self.set_brightness(brightness)
+        opacity = self.brightness_to_opacity(brightness)
 
-        # Transforma brilho em opacidade (100% brilho = 0 opacidade, 0% brilho = 255 opacidade)
-        opacity = round((100 - brightness) * 255 / 100)
-
-        # Envia mensagem assíncrona para a thread que possui a janela Win32
-        if self.hwnd:
-            user32.PostMessageW(
-                self.hwnd,
+        hwnd = self.get_hwnd()
+        if hwnd:
+            if not user32.PostMessageW(
+                hwnd,
                 WM_UPDATE_BRIGHTNESS,
                 opacity,
                 0
-            )
+            ):
+                print("Aviso: falha ao enviar atualização de brilho.")
 
         print(f"Brilho selecionado: {brightness}%")
 
@@ -433,7 +588,7 @@ class EasyShineApp:
             item(
                 f"Brilho {b}%",
                 self.create_brightness_callback(b),
-                checked=lambda menu_item, b=b: self.current_brightness == b,
+                checked=lambda menu_item, b=b: self.get_brightness() == b,
                 radio=True
             )
             for b in range(100, -1, -10)
@@ -481,7 +636,15 @@ class EasyShineApp:
                 return
             self.running = False
 
-        if self.overlay_thread_id:
+        hwnd = self.get_hwnd()
+        posted = False
+
+        # Caminho preferencial: mensagem para a janela (fila já existe após CreateWindow).
+        if hwnd:
+            posted = bool(user32.PostMessageW(hwnd, WM_SHUTDOWN_OVERLAY, 0, 0))
+
+        # Fallback: WM_QUIT na thread (fila criada via PeekMessage no startup).
+        if not posted and self.overlay_thread_id:
             user32.PostThreadMessageW(
                 self.overlay_thread_id,
                 WM_QUIT,
@@ -517,5 +680,9 @@ if __name__ == "__main__":
         if app:
             app.quit_app()
     except Exception:
+        if app:
+            app.quit_app()
+            if app.overlay_thread.is_alive():
+                app.overlay_thread.join(timeout=3)
         traceback.print_exc()
         input("\nPressione ENTER para sair...")
