@@ -64,8 +64,13 @@ PM_NOREMOVE = 0x0000
 ERROR_CLASS_ALREADY_EXISTS = 1410
 BLACK_BRUSH = 4
 TIMER_TOPMOST = 1
-TOPMOST_INTERVAL_MS = 2000
+TOPMOST_INTERVAL_MS = 1000
 DEFAULT_BRIGHTNESS = 80
+APP_VERSION = "1.0.3"
+
+EVENT_SYSTEM_FOREGROUND = 0x0003
+WINEVENT_OUTOFCONTEXT = 0x0000
+WINEVENT_SKIPOWNPROCESS = 0x0002
 
 
 # =========================================================
@@ -100,11 +105,15 @@ user32.ShowWindow.restype = wintypes.BOOL
 user32.DestroyWindow.argtypes = [wintypes.HWND]
 user32.DestroyWindow.restype = wintypes.BOOL
 
-user32.RegisterClassW.argtypes = [ctypes.POINTER(ctypes.c_byte)]
 user32.RegisterClassW.restype = wintypes.WORD
 
 user32.UnregisterClassW.argtypes = [wintypes.LPCWSTR, wintypes.HINSTANCE]
 user32.UnregisterClassW.restype = wintypes.BOOL
+
+user32.SetWinEventHook.restype = wintypes.HANDLE
+
+user32.UnhookWinEvent.argtypes = [wintypes.HANDLE]
+user32.UnhookWinEvent.restype = wintypes.BOOL
 
 user32.CreateWindowExW.argtypes = [
     wintypes.DWORD,
@@ -204,6 +213,17 @@ WNDPROC = ctypes.WINFUNCTYPE(
     wintypes.LPARAM
 )
 
+WINEVENTPROC = ctypes.WINFUNCTYPE(
+    None,
+    wintypes.HANDLE,
+    wintypes.DWORD,
+    wintypes.HWND,
+    wintypes.LONG,
+    wintypes.LONG,
+    wintypes.DWORD,
+    wintypes.DWORD
+)
+
 
 class WNDCLASSW(ctypes.Structure):
     _fields_ = [
@@ -220,8 +240,16 @@ class WNDCLASSW(ctypes.Structure):
     ]
 
 
-# RegisterClassW espera POINTER(WNDCLASSW); ajusta após a struct existir.
 user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+user32.SetWinEventHook.argtypes = [
+    wintypes.DWORD,
+    wintypes.DWORD,
+    wintypes.HMODULE,
+    WINEVENTPROC,
+    wintypes.DWORD,
+    wintypes.DWORD,
+    wintypes.DWORD
+]
 
 
 # =========================================================
@@ -240,6 +268,9 @@ class EasyShineApp:
 
         self.icon = None
         self.hwnd = None
+        self.overlay_bounds = None
+        self.win_event_hook = None
+        self.win_event_proc_callback = None
 
         self.commands = queue.Queue()
         self.shutdown_lock = threading.Lock()
@@ -297,6 +328,15 @@ class EasyShineApp:
         brightness = max(0, min(100, int(brightness)))
         return round((100 - brightness) * 255 / 100)
 
+    def current_opacity(self):
+        return self.brightness_to_opacity(self.get_brightness())
+
+    def reapply_current_opacity(self, hwnd=None):
+        target = hwnd or self.get_hwnd()
+        if not target:
+            return False
+        return self.apply_opacity_native(target, self.current_opacity())
+
     # =====================================================
     # MONITORES
     # =====================================================
@@ -308,7 +348,7 @@ class EasyShineApp:
         height = user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
         return x, y, width, height
 
-    def refresh_overlay_bounds(self):
+    def refresh_overlay_bounds(self, force=False):
         hwnd = self.get_hwnd()
         if not hwnd:
             return False
@@ -316,6 +356,10 @@ class EasyShineApp:
         x, y, width, height = self.get_virtual_screen()
         if width <= 0 or height <= 0:
             return False
+
+        bounds = (x, y, width, height)
+        if not force and bounds == self.overlay_bounds:
+            return True
 
         ok = user32.SetWindowPos(
             hwnd,
@@ -326,6 +370,10 @@ class EasyShineApp:
             height,
             SWP_NOZORDER | SWP_NOACTIVATE
         )
+        if ok:
+            self.overlay_bounds = bounds
+            # SetWindowPos em janela layered pode zerar o alpha.
+            self.reapply_current_opacity(hwnd)
         return bool(ok)
 
     def ensure_topmost(self):
@@ -339,7 +387,23 @@ class EasyShineApp:
             0, 0, 0, 0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
         )
+        if ok:
+            # Reaplica alpha: SetWindowPos pode resetar atributos layered.
+            self.reapply_current_opacity(hwnd)
         return bool(ok)
+
+    def on_foreground_changed(
+        self,
+        h_win_event_hook,
+        event,
+        hwnd,
+        id_object,
+        id_child,
+        event_thread,
+        event_time
+    ):
+        if event == EVENT_SYSTEM_FOREGROUND and self.running:
+            self.ensure_topmost()
 
     # =====================================================
     # PROCEDIMENTO DA JANELA (WINDOW PROC)
@@ -361,12 +425,12 @@ class EasyShineApp:
             return 0
 
         if msg == WM_DISPLAYCHANGE:
-            self.refresh_overlay_bounds()
+            self.refresh_overlay_bounds(force=True)
             self.ensure_topmost()
             return 0
 
         if msg == WM_TIMER and wparam == TIMER_TOPMOST:
-            self.refresh_overlay_bounds()
+            # Só reafirma topmost + alpha; não redimensiona a cada tick.
             self.ensure_topmost()
             return 0
 
@@ -449,8 +513,9 @@ class EasyShineApp:
                 raise ctypes.WinError(ctypes.get_last_error())
 
             self.set_hwnd(hwnd)
+            self.overlay_bounds = (x, y, width, height)
 
-            initial_opacity = self.brightness_to_opacity(self.get_brightness())
+            initial_opacity = self.current_opacity()
             if not self.apply_opacity_native(hwnd, initial_opacity):
                 raise ctypes.WinError(ctypes.get_last_error())
 
@@ -467,9 +532,25 @@ class EasyShineApp:
                 user32.ShowWindow(hwnd, SW_SHOWNA)
                 if not self.ensure_topmost():
                     raise ctypes.WinError(ctypes.get_last_error())
+            else:
+                # SetWindowPos pode resetar o alpha da janela layered.
+                if not self.reapply_current_opacity(hwnd):
+                    raise ctypes.WinError(ctypes.get_last_error())
 
             if not user32.SetTimer(hwnd, TIMER_TOPMOST, TOPMOST_INTERVAL_MS, None):
                 raise ctypes.WinError(ctypes.get_last_error())
+
+            # Reaplica topmost quando outra janela ganha foco (Explorer, etc.).
+            self.win_event_proc_callback = WINEVENTPROC(self.on_foreground_changed)
+            self.win_event_hook = user32.SetWinEventHook(
+                EVENT_SYSTEM_FOREGROUND,
+                EVENT_SYSTEM_FOREGROUND,
+                None,
+                self.win_event_proc_callback,
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
+            )
 
             self.overlay_ready.set()
 
@@ -487,6 +568,10 @@ class EasyShineApp:
             traceback.print_exc()
 
         finally:
+            if self.win_event_hook:
+                user32.UnhookWinEvent(self.win_event_hook)
+                self.win_event_hook = None
+
             hwnd = self.get_hwnd()
             if hwnd:
                 user32.KillTimer(hwnd, TIMER_TOPMOST)
@@ -607,7 +692,7 @@ class EasyShineApp:
         self.icon = pystray.Icon(
             "EasyShine",
             self.load_icon_image(),
-            "EasyShine - Controle de Brilho",
+            f"EasyShine {APP_VERSION} - Controle de Brilho",
             menu
         )
 
